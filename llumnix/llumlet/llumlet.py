@@ -182,3 +182,39 @@ class Llumlet:
     async def execute_migration_method_async(self, method, *args, **kwargs):
         executor = getattr(self.migration_coordinator, method)
         return await executor(*args, **kwargs)
+    
+    async def call_engine_utility_async(self, method: str, *args, **kwargs) -> any:
+        """
+        Executes a engine utility method on the backend engine via a Ray remote call.
+
+        This method is called remotely by a client. It dynamically finds the
+        method on the core engine object (`self.backend_engine.engine`) and
+        executes it. It handles both synchronous and asynchronous utility methods.
+
+        Args:
+            method: The name of the method to execute.
+            *args: Positional arguments for the method.
+            **kwargs: Keyword arguments for the method.
+
+        Returns:
+            The result of the executed utility method.
+        """
+        # As per the hint, the target object containing utility functions
+        # is self.backend_engine.engine.
+        target_engine = self.backend_engine.engine
+
+        try:
+            executor = getattr(target_engine, method)
+        except AttributeError as e:
+            logger.error(f"Utility method '{method}' not found on backend engine {target_engine}.")
+            raise e
+
+        # The target method could be a regular function or an async coroutine.
+        # We handle both cases correctly.
+        if asyncio.iscoroutinefunction(executor):
+            # If it's a coroutine, await it.
+            return await executor(*args, **kwargs)
+        else:
+            # If it's a regular synchronous function, just call it.
+            # Ray's async actor will handle running it in a thread pool.
+            return executor(*args, **kwargs)
