@@ -13,6 +13,7 @@
 
 import signal
 import multiprocessing
+import threading
 from dataclasses import fields
 
 import uvloop
@@ -21,31 +22,41 @@ import ray
 from ray.util.placement_group import PlacementGroup
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
+# from vllm.v1.engine.async_llm import AsyncLLM
+# from vllm.v1.executor.abstract import Executor
+
 from llumnix.arg_utils import VLLMV1EntrypointsArgs
 from llumnix.entrypoints.utils import EntrypointsContext
 from llumnix.entrypoints.api_server_actor import APIServerActor
 from llumnix.queue.utils import init_request_output_queue_server, QueueType
 from llumnix.entrypoints.vllm_v1.arg_utils import VLLMV1EngineArgs
-from llumnix.ray_utils import log_actor_ray_info, get_server_name
+from llumnix.ray_utils import (log_actor_ray_info, get_server_name,
+                               get_scaler_name, get_manager_name,
+                               get_instance_name)
 from llumnix.logging.logger import init_logger
 from llumnix.utils import get_ip_address
+
+# from llumnix.entrypoints.vllm_v1.utils import (setup_server, run_server_proc)
+
+TIMEOUT_KEEP_ALIVE = 5  # seconds
 
 logger = init_logger(__name__)
 
 
 class APIServerActorVLLMV1(APIServerActor):
-    # def __init__(self,
-    #              instance_id: str,
-    #              entrypoints_args: VLLMV1EntrypointsArgs,
-    #              engine_args: VLLMV1EngineArgs,
-    #              scaler: "ray.actor.ActorHandle",
-    #              manager: "ray.actor.ActorHandle",
-    #              instance: "ray.actor.ActorHandle"):
-    #     super().__init__(instance_id, entrypoints_args, engine_args,
-    #                      scaler, manager, instance)
-    #     # Shutdown only the API server processes on garbage collection
-    #     # The extra processes are managed by their owners
-    #     self._finalizer = weakref.finalize(self, shutdown, self.processes)
+    def __init__(self,
+                 instance_id: str,
+                 entrypoints_args: VLLMV1EntrypointsArgs,
+                 engine_args: VLLMV1EngineArgs,
+                 scaler: "ray.actor.ActorHandle",
+                 manager: "ray.actor.ActorHandle",
+                 instance: "ray.actor.ActorHandle"):
+        self.listen_address, self.sock = setup_server(entrypoints_args)
+        super().__init__(instance_id, entrypoints_args, engine_args,
+                         scaler, manager, instance)
+        # Shutdown only the API server processes on garbage collection
+        # The extra processes are managed by their owners
+        # self._finalizer = weakref.finalize(self, shutdown, self.processes)
 
     def _start_server(self):
         # vLLM V1 needs a separate process to run the server since it needs to add signal handlers.
@@ -64,18 +75,18 @@ class APIServerActorVLLMV1(APIServerActor):
                     engine_args: VLLMV1EngineArgs,
                     entrypoints_context: EntrypointsContext):
         # Set up listen address and socket
-        self.listen_address, self.sock = setup_server(entrypoints_args)
+        # self.listen_address, self.sock = setup_server(entrypoints_args)
 
         # If dp_size == 1, client_index will always be 0
         self.client_index = 0
         self.server_id = entrypoints_context.server_info.server_id
 
         # NOTE(shejiarui): Hard code here. The logic of handshake will be removed soon.
-        # client_config = {
-        #     "input_address": "ipc:///tmp/58dd6824-0fbc-4221-865d-70ce72247d85",
-        #     "output_address": "ipc:///tmp/eac4f94c-d6c2-4fb6-a35c-3b0c4ddcf52c",
-        #     "client_index": self.client_index
-        # }
+        client_config = {
+            # "input_address": "ipc:///tmp/58dd6824-0fbc-4221-865d-70ce72247d85",
+            # "output_address": "ipc:///tmp/eac4f94c-d6c2-4fb6-a35c-3b0c4ddcf52c",
+            "client_index": self.client_index
+        }
         
         serve_args = engine_args.load_engine_args()
         for field in fields(VLLMV1EntrypointsArgs):
@@ -83,12 +94,42 @@ class APIServerActorVLLMV1(APIServerActor):
         if hasattr(serve_args, "speculative_config"):
             serve_args.speculative_config = None
 
-        spawn_context = multiprocessing.get_context("spawn")
-        self.proc = spawn_context.Process(
-            target=_run_server_proc, 
-            name=f"Server_{self.server_id}",  
-            args=(self.listen_address, self.sock, serve_args))
-        self.proc.start()
+        self.run_server_thread = threading.Thread(
+            target=self.run_server_proc, 
+            args=(self.listen_address, self.sock, serve_args, client_config),
+            daemon=True, name="run_server"
+        )
+        self.run_server_thread.start()
+
+        # Set global variable in vLLM
+        # import vllm.v1.engine.core_client
+        # vllm.v1.engine.core_client.entrypoints_context = self.entrypoints_context
+        # TODO(shejiarui): `fork` may cause issues in multi-threading environment.
+        # fork_context = multiprocessing.get_context("fork")
+        # self.proc = fork_context.Process(
+        #     target=self.run_server_proc, 
+        #     name=f"Server_{self.server_id}",
+        #     args=(self.listen_address, self.sock, serve_args, client_config))
+            # args=(self.listen_address, self.sock, serve_args, 
+            #       self.instance_id, self.request_output_queue, client_config))  
+            # args=(self.listen_address, self.sock, serve_args, self.instance_id
+            #       entrypoints_context.server_info, entrypoints_context.log_requests,
+            #       entrypoints_context.log_request_timestamps, client_config,))
+        # self.proc.start()
+
+    def run_server_proc(self,
+                        listen_address, 
+                        sock, 
+                        args, 
+                        client_config=None,
+                        **uvicorn_kwargs) -> None:
+        # Set global variable in vLLM
+        import vllm.v1.engine.core_client
+        from vllm.entrypoints.openai.api_server import run_server_worker
+        vllm.v1.engine.core_client.entrypoints_context = self.entrypoints_context
+        uvloop.run(
+            run_server_worker(listen_address, sock, 
+                            args, client_config, **uvicorn_kwargs))
 
     def _stop_server(self):
         if self.proc.is_alive():
@@ -142,12 +183,29 @@ def setup_server(entrypoints_args: VLLMV1EntrypointsArgs):
     return listen_address, sock
 
 
-def _run_server_proc(listen_address, 
-                     sock, 
-                     args, 
-                     client_config=None, 
-                     **uvicorn_kwargs) -> None:
-    from vllm.entrypoints.openai.api_server import run_server_worker
-    uvloop.run(
-        run_server_worker(listen_address, sock, 
-                          args, client_config, **uvicorn_kwargs))
+# def run_server_proc(listen_address, 
+#                     sock, 
+#                     args, 
+#                     instance_id,
+#                     request_output_queue,
+#                     # log_requests,
+#                     # log_request_timestamps,
+#                     client_config=None,
+#                     **uvicorn_kwargs) -> None:
+#     # Build EntrypointsContext
+#     scaler = ray.get_actor(get_scaler_name(), namespace="llumnix")
+#     manager = ray.get_actor(get_manager_name(), namespace="llumnix")
+#     instance = ray.get_actor(get_instance_name(instance_id), namespace="llumnix")
+#     server = ray.get_actor(get_server_name(instance_id), namespace="llumnix")
+#     from llumnix.entrypoints.setup import setup_entrypoints_context
+#     entrypoints_context = setup_entrypoints_context(
+#         args, scaler, manager, [instance_id], [instance], request_output_queue, server
+#     )
+#     # Set global variable in vLLM
+#     import vllm.v1.engine.core_client
+#     from vllm.entrypoints.openai.api_server import run_server_worker
+#     vllm.v1.engine.core_client.entrypoints_context = entrypoints_context
+
+#     uvloop.run(
+#         run_server_worker(listen_address, sock, 
+#                           args, client_config, **uvicorn_kwargs))
